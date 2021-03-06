@@ -1,41 +1,39 @@
 from argparse import ArgumentParser
 
+import os
 import torch
 import pytorch_lightning as pl
+from pytorch_lightning.metrics import functional as PLF
 from torch.nn import functional as F
-from torch.utils.data import DataLoader, random_split
-
-from torchvision.datasets.mnist import MNIST
+from flash.vision import ImageClassificationData
 from torchvision import transforms
-
-
-class Backbone(torch.nn.Module):
-    def __init__(self, hidden_dim=128):
-        super().__init__()
-        self.l1 = torch.nn.Linear(28 * 28, hidden_dim)
-        self.l2 = torch.nn.Linear(hidden_dim, 10)
-
-    def forward(self, x):
-        x = x.view(x.size(0), -1)
-        x = torch.relu(self.l1(x))
-        x = torch.relu(self.l2(x))
-        return x
+from torchvision import models
+import numpy as np
 
 
 class LitClassifier(pl.LightningModule):
-    def __init__(self, backbone, learning_rate=1e-3):
+    def __init__(self, backbone='resnet50', num_classes=5, hidden_dim=1024, learning_rate=1e-3):
         super().__init__()
         self.save_hyperparameters()
-        self.backbone = backbone
+        self.backbone = getattr(models, backbone)()
+        self.classifier = torch.nn.Sequential(
+            torch.nn.Linear(1000, hidden_dim),
+            torch.nn.Linear(hidden_dim, num_classes)
+        )
 
-    def forward(self, x):
-        # use forward for inference/predictions
-        embedding = self.backbone(x)
-        return embedding
+    def forward(self, batch):
+        x, y = batch
+
+        # used only in .predict()
+        y_hat = self.backbone(x)
+        y_hat = self.classifier(y_hat)
+        predicted_classes = F.log_softmax(y_hat).argmax(dim=1)
+        return predicted_classes
 
     def training_step(self, batch, batch_idx):
         x, y = batch
         y_hat = self.backbone(x)
+        y_hat = self.classifier(y_hat)
         loss = F.cross_entropy(y_hat, y)
         self.log('train_loss', loss, on_epoch=True)
         return loss
@@ -43,14 +41,20 @@ class LitClassifier(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         x, y = batch
         y_hat = self.backbone(x)
+        y_hat = self.classifier(y_hat)
         loss = F.cross_entropy(y_hat, y)
-        self.log('valid_loss', loss, on_step=True)
+        acc = PLF.accuracy(F.log_softmax(y_hat).argmax(dim=1), y)
+        self.log('valid_loss', loss)
+        self.log('valid_acc', acc)
 
     def test_step(self, batch, batch_idx):
         x, y = batch
         y_hat = self.backbone(x)
+        y_hat = self.classifier(y_hat)
         loss = F.cross_entropy(y_hat, y)
+        acc = PLF.accuracy(F.log_softmax(y_hat).argmax(dim=1), y)
         self.log('test_loss', loss)
+        self.log('test_acc', acc)
 
     def configure_optimizers(self):
         # self.hparams available because we called self.save_hyperparameters()
@@ -60,6 +64,10 @@ class LitClassifier(pl.LightningModule):
     def add_model_specific_args(parent_parser):
         parser = ArgumentParser(parents=[parent_parser], add_help=False)
         parser.add_argument('--learning_rate', type=float, default=0.0001)
+        parser.add_argument('--backbone', type=str, default='resnet50')
+        parser.add_argument('--batch_size', default=32, type=int)
+        parser.add_argument('--num_classes', default=5, type=int)
+        parser.add_argument('--hidden_dim', type=int, default=1024)
         return parser
 
 
@@ -70,39 +78,61 @@ def cli_main():
     # args
     # ------------
     parser = ArgumentParser()
-    parser.add_argument('--batch_size', default=32, type=int)
-    parser.add_argument('--hidden_dim', type=int, default=128)
+    parser.add_argument('--data_dir', type=str, default='.')
+
+    # add trainer args (gpus=x, precision=...)
     parser = pl.Trainer.add_argparse_args(parser)
+
+    # add model args (batch_size hidden_dim, etc...), anything defined in add_model_specific_args
     parser = LitClassifier.add_model_specific_args(parser)
     args = parser.parse_args()
 
     # ------------
     # data
     # ------------
-    dataset = MNIST('', train=True, download=True, transform=transforms.ToTensor())
-    mnist_test = MNIST('', train=False, download=True, transform=transforms.ToTensor())
-    mnist_train, mnist_val = random_split(dataset, [55000, 5000])
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.4913, 0.482, 0.446], std=[0.247, 0.243, 0.261])
+    ])
 
-    train_loader = DataLoader(mnist_train, batch_size=args.batch_size)
-    val_loader = DataLoader(mnist_val, batch_size=args.batch_size)
-    test_loader = DataLoader(mnist_test, batch_size=args.batch_size)
+    # in real life you would have a separate validation split
+    datamodule = ImageClassificationData.from_folders(
+        train_folder=args.data_dir + '/train',
+        valid_folder=args.data_dir + '/test',
+        test_folder=args.data_dir + '/test',
+        batch_size=args.batch_size,
+        transform=transform
+    )
 
     # ------------
     # model
     # ------------
-    model = LitClassifier(Backbone(hidden_dim=args.hidden_dim), args.learning_rate)
+    model = LitClassifier(
+        backbone=args.backbone,
+        learning_rate=args.learning_rate,
+        hidden_dim=args.hidden_dim
+    )
 
     # ------------
     # training
     # ------------
-    trainer = pl.Trainer.from_argparse_args(args)
-    trainer.fit(model, train_loader, val_loader)
+    trainer = pl.Trainer.from_argparse_args(args, fast_dev_run=True)
+    trainer.fit(model, datamodule.train_dataloader(), datamodule.val_dataloader())
 
     # ------------
     # testing
     # ------------
-    result = trainer.test(test_dataloaders=test_loader)
+    result = trainer.test(model, test_dataloaders=datamodule.test_dataloader())
     print(result)
+
+    # predicting
+    preds = trainer.predict(model, datamodule.test_dataloader())
+    preds = list(np.stack(preds).flatten())
+
+    path = os.getcwd() + '/predictions.txt'
+    with open(path, 'w') as f:
+        preds = [str(x) for x in preds]
+        f.write('\n'.join(preds))
 
 
 if __name__ == '__main__':

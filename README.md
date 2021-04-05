@@ -2,5 +2,5 @@
 
 ```python
 pip install -r requirements.txt
-python cifar5.py --data_dir data/path/cifar5
+python project/lit_image_classifier.py --data_dir data/path/cifar5
 ```

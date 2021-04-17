@@ -1,4 +1,4 @@
 matplotlib>=3.0
 lightning-flash==0.2.2
-lightning-bolts[extra]>=0.3.2  # to drop warnings
+lightning-bolts>=0.3.3
 PyYAML==5.4

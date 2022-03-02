@@ -3,7 +3,7 @@ from argparse import ArgumentParser
 import os
 import torch
 import pytorch_lightning as pl
-from pytorch_lightning.metrics import functional as PLF
+from torchmetrics import functional as PLF
 from torch.nn import functional as F
 from flash.vision import ImageClassificationData
 from torchvision import transforms
